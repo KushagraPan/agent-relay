@@ -1,0 +1,37 @@
+services:
+  postgres:
+    image: postgres:16-alpine
+    container_name: postgres
+    environment:
+      POSTGRES_DB: ${POSTGRES_DB:-agent_relay}
+      POSTGRES_USER: ${POSTGRES_USER:-postgres}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-postgres}
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+    ports:
+      - "${POSTGRES_PORT:-5432}:5432"
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER:-postgres} -d ${POSTGRES_DB:-agent_relay}"]
+      interval: 5s
+      timeout: 5s
+      retries: 5
+      start_period: 5s
+    restart: unless-stopped
+
+  relay:
+    build: .
+    container_name: relay
+    ports:
+      - "${RELAY_PORT:-8000}:8000"
+    environment:
+      RELAY_DATABASE_URL: postgresql+psycopg://${POSTGRES_USER:-postgres}:${POSTGRES_PASSWORD:-postgres}@postgres:5432/${POSTGRES_DB:-agent_relay}
+      RELAY_LEASE_SECONDS: ${RELAY_LEASE_SECONDS:-60}
+      RELAY_MAX_ATTEMPTS: ${RELAY_MAX_ATTEMPTS:-5}
+      RELAY_RECOVERY_INTERVAL_SECONDS: ${RELAY_RECOVERY_INTERVAL_SECONDS:-5}
+    depends_on:
+      postgres:
+        condition: service_healthy
+    restart: unless-stopped
+
+volumes:
+  postgres_data:

@@ -9,6 +9,7 @@ engine and a row-locking claim transaction is the planned student exercise.
 from __future__ import annotations
 
 import os
+import time
 from contextlib import contextmanager
 from datetime import datetime, timezone
 from typing import Any, Generator
@@ -18,8 +19,17 @@ from sqlalchemy.engine import Engine
 from sqlalchemy.orm import DeclarativeBase, Mapped, Session, mapped_column, relationship, sessionmaker
 
 
+def _normalize_database_url(url: str) -> str:
+    if url.startswith("postgresql://"):
+        return "postgresql+psycopg://" + url[len("postgresql://"):]
+    if url.startswith("postgres://"):
+        return "postgresql+psycopg://" + url[len("postgres://"):]
+    return url
+
+
 def _database_url() -> str:
-    return os.getenv("RELAY_DATABASE_URL") or os.getenv("DATABASE_URL") or "sqlite:///./agent-relay.db"
+    raw = os.getenv("RELAY_DATABASE_URL") or os.getenv("DATABASE_URL") or "sqlite:///./agent-relay.db"
+    return _normalize_database_url(raw)
 
 
 def positive_int(name: str, default: int) -> int:
@@ -158,8 +168,15 @@ if _is_sqlite(DATABASE_URL):
 SessionLocal = sessionmaker(bind=engine, class_=Session, expire_on_commit=False, autoflush=True)
 
 
-def init_db() -> None:
-    Base.metadata.create_all(engine)
+def init_db(retries: int = 5, delay: float = 1.0) -> None:
+    for attempt in range(retries):
+        try:
+            Base.metadata.create_all(engine)
+            return
+        except Exception:
+            if attempt == retries - 1:
+                raise
+            time.sleep(delay)
 
 
 @contextmanager
@@ -177,19 +194,21 @@ def db_session() -> Generator[Session, None, None]:
 
 @contextmanager
 def immediate_transaction() -> Generator[Session, None, None]:
-    """Run one SQLite writer transaction before selecting or changing work.
+    """Run one writer transaction before selecting or changing work.
 
-    SQLite does not support PostgreSQL's ``FOR UPDATE SKIP LOCKED``.  A
-    ``BEGIN IMMEDIATE`` writer reservation serializes claims (and recovery or
-    terminal submissions) across API processes, giving each task one active
-    lease.  This is the intentionally isolated seam for a future PostgreSQL
-    implementation.
+    In SQLite, SQLite does not support ``FOR UPDATE SKIP LOCKED``, so a
+    ``BEGIN IMMEDIATE`` writer reservation serializes claims across processes.
+    In PostgreSQL, transactions use standard ``BEGIN``, and row-level locking
+    with ``SELECT ... FOR UPDATE SKIP LOCKED`` coordinates concurrent claims.
     """
 
     connection = engine.connect()
     session = Session(bind=connection, expire_on_commit=False, autoflush=True)
     try:
-        connection.exec_driver_sql("BEGIN IMMEDIATE")
+        if engine.dialect.name == "sqlite":
+            connection.exec_driver_sql("BEGIN IMMEDIATE")
+        else:
+            connection.begin()
         yield session
         session.flush()
         connection.commit()
@@ -214,8 +233,17 @@ def recover_expired_in_session(db: Session, now: datetime) -> int:
     )
     count = 0
     for attempt in expired:
-        task = db.get(Task, attempt.task_id)
-        if task is None or attempt.outcome != "processing":
+        task = db.get(Task, attempt.task_id, with_for_update=True)
+        if task is None:
+            continue
+        try:
+            db.refresh(attempt, with_for_update=True)
+        except Exception:
+            pass
+        if attempt.outcome != "processing":
+            continue
+        attempt_lease = db_time(attempt.lease_expires_at)
+        if attempt_lease is not None and attempt_lease > now:
             continue
         attempt.outcome = "expired"
         attempt.finished_at = now_db
