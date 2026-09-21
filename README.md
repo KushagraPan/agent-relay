@@ -1,102 +1,201 @@
-# Agent Relay (SQLite starter)
+# Agent Relay
 
-Agent Relay is a small FastAPI service for registering agents, delivering one
-task at a time, and recording results. The local starter is self-contained:
-SQLite persists the queue and attempts, while workers execute tasks on their own
-machines. The included worker deterministically returns `input.upper()`.
+Agent Relay is an asynchronous task coordination service for distributed agents. Agents register identities, submit tasks to target agents, claim assigned tasks from an inbox queue, send periodic heartbeats while working, and report execution results or errors.
 
-## Run it
+This repository is an extension of the DataTalksClub AI Dev Tools Zoomcamp Agent Relay starter project. It extends the original SQLite implementation with PostgreSQL persistence and concurrency controls, containerization with Docker and Docker Compose, Kubernetes manifests for Kind clusters, integration test coverage, and an automated GitHub Actions CI/CD pipeline supported locally via `act`.
 
-```bash
-uv sync
-uv run uvicorn main:app --reload
+## Architecture
+
+```
+                 +-------------------+
+                 |   Client / CLI    |
+                 +---------+---------+
+                           |
+                     HTTP  |  (REST)
+                           v
++----------+      +-------------------+      +----------+
+| Worker 1 | <--> |  FastAPI Relay    | <--> | Worker 2 |
++----------+      +---------+---------+      +----------+
+                            |
+                   SQLAlchemy / psycopg
+                            v
+                  +-------------------+
+                  |    PostgreSQL     |
+                  +-------------------+
 ```
 
-Open <http://127.0.0.1:8000/> for the token-based local dashboard. The default
-database is `./agent-relay.db`; set `RELAY_DATABASE_URL` to use another SQLite
-file. `GET /health` is a liveness check and `GET /ready` verifies database
-connectivity and schema (it queries the real tables, so a wiped volume
-reports not-ready instead of passing with zero tables).
+- **FastAPI HTTP API (`main.py`, `schemas.py`)**: Exposes REST endpoints for identity registration, task submission, claiming, heartbeats, and status reporting. Relay is the single component with database access.
+- **PostgreSQL Database (`database.py`, `storage.py`)**: Stores agents, tasks, and attempt records. Uses PostgreSQL `FOR UPDATE SKIP LOCKED` to allow multiple worker processes to claim tasks concurrently without collisions.
+- **Workers (`worker.py`)**: External worker processes that communicate exclusively with Relay over HTTP using token authentication.
 
-Register two identities and send a task:
+## Task Lifecycle
 
-```bash
-alice=$(curl -sS -X POST http://127.0.0.1:8000/api/v1/agents \
-  -H 'content-type: application/json' -d '{"name":"alice"}')
-bob=$(curl -sS -X POST http://127.0.0.1:8000/api/v1/agents \
-  -H 'content-type: application/json' -d '{"name":"uppercase"}')
+Tasks transition through three states:
+
+1. **`queued`**: A task is submitted via `POST /api/v1/tasks` with a recipient agent ID and input payload.
+2. **`processing`**: An assigned worker claims the task via `POST /api/v1/tasks/claim`. A lease duration (`RELAY_LEASE_SECONDS`, default 60s) is assigned. The worker sends heartbeats (`POST /api/v1/tasks/{task_id}/attempts/{attempt_id}/heartbeat`) to keep the lease active.
+3. **`completed` / `failed`**: The worker reports completion (`.../complete`) or failure (`.../fail`) along with its claim token. Repeated submissions with the same claim token are idempotent. If a lease expires without a heartbeat, the task returns to the queue up to `RELAY_MAX_ATTEMPTS`.
+
+## Project Structure
+
+```text
+.
+├── .github/workflows/
+│   └── ci.yml                 # CI/CD pipeline definition
+├── k8s/                       # Kubernetes manifests for Kind deployment
+│   ├── postgres-configmap.yaml
+│   ├── postgres-secret.yaml
+│   ├── postgres-pvc.yaml
+│   ├── postgres-deployment.yaml
+│   ├── postgres-service.yaml
+│   ├── relay-deployment.yaml
+│   └── relay-service.yaml
+├── .actrc                     # Runner image configuration for act
+├── docker-compose.yml         # Multi-container PostgreSQL and Relay setup
+├── Dockerfile                 # Container build definition for Relay
+├── database.py                # SQLAlchemy models, engine setup, and schema init
+├── storage.py                 # Queue operations, row locking, and state transitions
+├── main.py                    # FastAPI application routes, lifecycle, and CLI
+├── schemas.py                 # Pydantic request and response schemas
+├── worker.py                  # Worker polling implementation
+├── test_agent_relay.py        # Protocol, concurrency, and lease tests
+├── test_acceptance_scenario_1.py # End-to-end integration and worker flow test
+└── pyproject.toml / uv.lock   # Dependencies and locked environments
 ```
 
-The response contains each agent's secret `token` once. Keep it outside source
-control. Use `Authorization: Bearer <token>` for all subsequent API calls;
-registration is the only unauthenticated endpoint. For a shared installation,
-set `RELAY_ENROLLMENT_SECRET` and send it as `X-Enrollment-Secret` when
-registering.
+## Local Development (uv)
 
-## Run the deterministic worker
+Prerequisites: Python 3.11+, `uv`.
 
-The worker can register itself and save credentials in a mode-0600 JSON file:
+1. Install dependencies:
+   ```bash
+   uv sync
+   ```
 
-```bash
-uv run python main.py worker \
-  --base-url http://127.0.0.1:8000 \
-  --name uppercase \
-  --credentials ./uppercase-credentials.json \
-  --worker-id laptop-1
-```
+2. Run the Relay API server:
+   ```bash
+   # Using SQLite (default for local development)
+   uv run uvicorn main:app --reload
 
-For failure/redelivery demonstrations, make local execution intentionally slow
-and stop the process after one completion:
+   # Or using a local PostgreSQL instance
+   export RELAY_DATABASE_URL="postgresql+psycopg://postgres:postgres@localhost:5432/agent_relay"
+   uv run python -c "from database import init_db; init_db()"
+   uv run uvicorn main:app --reload
+   ```
 
-```bash
-uv run python main.py worker --credentials ./uppercase-credentials.json \
-  --slow-seconds 75 --worker-id slow-laptop
-```
+3. Run a worker process:
+   ```bash
+   uv run python main.py worker \
+     --base-url http://127.0.0.1:8000 \
+     --name uppercase \
+     --worker-id worker-1
+   ```
 
-The worker heartbeats during long work. Killing it leaves the claim leased;
-after the 60-second lease expires, another worker can claim the task with a new
-token and incremented attempt number. `RELAY_LEASE_SECONDS` and
-`RELAY_MAX_ATTEMPTS` are configurable server settings.
+## Docker Compose
 
-An existing credential can also be supplied explicitly (the token is not
-written to disk):
+Run the complete stack (PostgreSQL and Relay) in Docker:
 
 ```bash
-uv run python main.py worker --agent-id agent_123 --token agt_… --worker-id laptop-2
+# Start services
+docker compose up -d --build
+
+# View service logs
+docker compose logs -f
+
+# Check container status
+docker compose ps
+
+# Stop and remove containers and volumes
+docker compose down -v
 ```
 
-## Storage and delivery behavior
+The Relay API is accessible at `http://localhost:8000`.
 
-`database.py` contains SQLAlchemy models, SQLite WAL setup, and the isolated
-`BEGIN IMMEDIATE` transaction helper. `storage.py` contains task/claim/recovery
-operations; routes and request models are kept in `main.py` and `schemas.py`.
-SQLite does not provide PostgreSQL's `FOR UPDATE SKIP LOCKED`, so the starter
-serializes writer transactions to make concurrent claims safe across processes.
-Students can port this storage seam to PostgreSQL later without changing the
-HTTP protocol or lifecycle in `SPEC.md`.
+## Kubernetes (Kind)
 
-Claims are at-least-once and leased for 60 seconds by default. Heartbeats extend
-an active lease. A completion or failure must include the recipient's bearer
-token and claim token. Repeating the exact terminal request with that claim
-token is idempotent; a stale token or different result receives `409`.
+Prerequisites: `kubectl`, `kind`, and `docker`.
 
-## Verify
+1. Create a Kind cluster:
+   ```bash
+   kind create cluster --name agent-relay
+   ```
 
-The test suite covers the main protocol, sender/recipient access boundaries,
-hashed claim-token behavior, idempotent terminal retries, concurrent claims,
-lease expiry before and after recovery, pagination/error shape, and dashboard
-asset serving:
+2. Build and load the Relay image into the cluster:
+   ```bash
+   docker build -t agent-relay-relay:latest .
+   kind load docker-image agent-relay-relay:latest --name agent-relay
+   ```
+
+3. Deploy PostgreSQL and Relay manifests:
+   ```bash
+   kubectl apply -f k8s/
+   ```
+
+4. Wait for rollouts to finish:
+   ```bash
+   kubectl rollout status deployment/postgres --timeout=120s
+   kubectl rollout status deployment/relay --timeout=120s
+   ```
+
+5. Forward the service port to test locally:
+   ```bash
+   kubectl port-forward svc/relay 8000:8000
+   ```
+
+## Testing
+
+Run the automated test suite using `uv`:
 
 ```bash
-uv run pytest -q
+# Runs test_agent_relay.py and test_acceptance_scenario_1.py
+uv run pytest -v
 ```
 
-Tests default to a scratch database at `/tmp/agent-relay-test.db` so they
-don't reset your dev server's `./agent-relay.db`. The fixture drops and
-recreates all tables on whatever `RELAY_DATABASE_URL` points at, so stop
-the dev server first or set `RELAY_DATABASE_URL` to a scratch file before
-running tests against another database.
+To run tests against PostgreSQL instead of SQLite:
+```bash
+export RELAY_DATABASE_URL="postgresql+psycopg://postgres:postgres@localhost:5432/agent_relay"
+uv run python -c "from database import init_db; init_db()"
+uv run pytest -v
+```
 
-This starter intentionally does not include Docker, Kubernetes, CI, external
-brokers, an LLM, or a PostgreSQL implementation. Those are deployment and
-student-port concerns rather than part of the local relay protocol.
+The test suite covers:
+- Agent registration and bearer token authentication
+- Task claim boundaries and concurrent access guarantees (`FOR UPDATE SKIP LOCKED`)
+- Lease expiration and attempt increment logic
+- Idempotent completion and failure reporting
+- Full end-to-end integration workflow with active workers (`test_acceptance_scenario_1.py`)
+
+## CI/CD Workflow
+
+The GitHub Actions workflow is defined in `.github/workflows/ci.yml`.
+
+### Pipeline Flow
+
+1. **Test (`test`)**:
+   - Spins up a `postgres:16-alpine` service container.
+   - Installs `uv` and synchronizes project dependencies (`uv sync --frozen`).
+   - Verifies database connectivity and initializes the schema.
+   - Runs `uv run pytest -v`. If any test fails, the job terminates and prevents deployment.
+2. **Build and Deploy (`build-and-deploy`, requires `test`)**:
+   - Generates a unique image tag: `agent-relay-relay:v-<short_sha>-<run_number>-<timestamp>`.
+   - Builds the Docker image with the unique tag.
+   - Loads the image into the Kind cluster (`agent-relay`).
+   - Applies the manifests in `k8s/`.
+   - Deploys the new image using `kubectl set image deployment/relay relay=agent-relay-relay:<tag>`.
+   - Waits for rollout completion (`kubectl rollout status`) and verifies running pod image versions.
+
+### Running CI Locally with `act`
+
+The workflow supports local execution using `act`:
+
+```bash
+act --pull=false
+```
+
+`.actrc` configures the `ubuntu-latest` runner image to `ghcr.io/catthehacker/ubuntu:act-latest`, providing the required local tooling and Docker CLI environment for executing the workflow under `act`.
+
+## Security
+
+- Agent tokens and database credentials must never be committed to version control.
+- The included `k8s/postgres-secret.yaml` manifest is provided for local Kind development and testing; production environments should inject credentials via an external secrets manager or KMS rather than static repository manifests.
+- Worker credentials generated locally (`*-credentials.json`) contain bearer tokens and are excluded via `.gitignore`.
