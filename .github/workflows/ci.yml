@@ -1,0 +1,166 @@
+name: CI/CD Pipeline
+
+on:
+  push:
+    branches: [ main ]
+  pull_request:
+    branches: [ main ]
+  workflow_dispatch:
+
+jobs:
+  test:
+    name: Run Tests against PostgreSQL
+    runs-on: ubuntu-latest
+    services:
+      postgres:
+        image: postgres:16-alpine
+        env:
+          POSTGRES_DB: agent_relay
+          POSTGRES_USER: postgres
+          POSTGRES_PASSWORD: postgres
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd pg_isready
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 5
+
+    steps:
+      - name: Checkout Code
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install uv
+        uses: astral-sh/setup-uv@v5
+        with:
+          enable-cache: false
+
+      - name: Sync Dependencies
+        run: |
+          uv sync --frozen
+
+      - name: Run Test Suite against PostgreSQL
+        run: |
+          # Wait for PostgreSQL service container to become ready
+          DB_HOST=""
+          for i in $(seq 1 30); do
+            for host in postgres localhost 127.0.0.1; do
+              if python -c "import socket; s = socket.socket(); s.settimeout(1); s.connect(('$host', 5432)); s.close()" 2>/dev/null; then
+                DB_HOST="$host"
+                echo "PostgreSQL is ready at $DB_HOST:5432 (attempt $i)"
+                break 2
+              fi
+            done
+            echo "Waiting for PostgreSQL service container... (attempt $i/30)"
+            sleep 1
+          done
+
+          if [ -z "$DB_HOST" ]; then
+            echo "ERROR: PostgreSQL service container is not available on postgres:5432 or localhost:5432!" >&2
+            exit 1
+          fi
+
+          export RELAY_DATABASE_URL="postgresql+psycopg://postgres:postgres@${DB_HOST}:5432/agent_relay"
+          echo "Configured RELAY_DATABASE_URL=$RELAY_DATABASE_URL"
+
+          # Explicitly initialize database schema on PostgreSQL before running tests
+          uv run python -c "from database import init_db; init_db(retries=10, delay=1.0)"
+
+          # Run the test suite against PostgreSQL
+          uv run pytest -v
+
+  build-and-deploy:
+    name: Build and Deploy to Kind Cluster
+    needs: test
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout Code
+        uses: actions/checkout@v4
+
+      - name: Ensure Docker socket access
+        run: |
+          if [ -e /var/run/docker.sock ]; then
+            sudo chmod 666 /var/run/docker.sock 2>/dev/null || true
+          fi
+
+      - name: Ensure kind and kubectl are installed
+        run: |
+          if ! command -v kubectl &> /dev/null; then
+            echo "Installing kubectl..."
+            curl -LO "https://dl.k8s.io/release/$(curl -L -s https://dl.k8s.io/release/stable.txt)/bin/linux/amd64/kubectl"
+            chmod +x kubectl
+            sudo mv kubectl /usr/local/bin/ 2>/dev/null || mv kubectl /usr/local/bin/ 2>/dev/null || export PATH="$PWD:$PATH"
+          fi
+
+          if ! command -v kind &> /dev/null || [ "$(kind --version | awk '{print $3}')" \< "v0.33.0" ]; then
+            echo "Installing kind v0.33.0..."
+            curl -Lo ./kind https://kind.sigs.k8s.io/dl/v0.33.0/kind-linux-amd64
+            chmod +x ./kind
+            sudo mv ./kind /usr/local/bin/kind 2>/dev/null || mv ./kind /usr/local/bin/kind 2>/dev/null || export PATH="$PWD:$PATH"
+          fi
+
+      - name: Generate Unique Image Tag
+        id: vars
+        run: |
+          SHORT_SHA=$(git rev-parse --short HEAD 2>/dev/null || echo "${GITHUB_SHA::7}")
+          TIMESTAMP=$(date +%s)
+          IMAGE_TAG="v-${SHORT_SHA:-local}-${GITHUB_RUN_NUMBER:-1}-${TIMESTAMP}"
+          echo "IMAGE_TAG=${IMAGE_TAG}" >> $GITHUB_ENV
+          echo "IMAGE_TAG=${IMAGE_TAG}" >> $GITHUB_OUTPUT
+          echo "Generated unique image tag: ${IMAGE_TAG}"
+
+      - name: Build Docker Image with Unique Tag
+        run: |
+          docker build -t "agent-relay-relay:${{ env.IMAGE_TAG }}" -t agent-relay-relay:latest .
+
+      - name: Configure Kind Cluster and Network Access
+        run: |
+          # Connect act runner container to kind network if running under act
+          CURRENT_CONTAINER=$(hostname)
+          docker network connect kind "$CURRENT_CONTAINER" 2>/dev/null || true
+
+          # Create kind cluster if it does not exist
+          if ! kind get clusters 2>/dev/null | grep -q '^agent-relay$'; then
+            echo "Creating kind cluster 'agent-relay'..."
+            kind create cluster --name agent-relay
+          fi
+
+          # Export kubeconfig: try internal endpoint for act containers, fallback to standard
+          kind export kubeconfig --name agent-relay --internal 2>/dev/null || kind export kubeconfig --name agent-relay
+          if ! kubectl cluster-info &>/dev/null; then
+            kind export kubeconfig --name agent-relay
+          fi
+          kubectl cluster-info
+
+      - name: Load Unique Image into Kind Cluster
+        run: |
+          if ! kind load docker-image "agent-relay-relay:${{ env.IMAGE_TAG }}" --name agent-relay; then
+            echo "Direct kind load failed, falling back to ctr import..."
+            docker save "agent-relay-relay:${{ env.IMAGE_TAG }}" | docker exec -i agent-relay-control-plane ctr -n k8s.io images import -
+          fi
+
+      - name: Apply Kubernetes Manifests
+        run: |
+          kubectl apply -f k8s/
+
+      - name: Deploy Unique Image Tag and Wait for Rollout
+        run: |
+          # Dynamically set container image to the unique tag without modifying YAML manifests on disk
+          kubectl set image deployment/relay relay="agent-relay-relay:${{ env.IMAGE_TAG }}"
+
+          # Wait for rollouts to complete
+          kubectl rollout status deployment/postgres --timeout=120s
+          kubectl rollout status deployment/relay --timeout=120s
+
+      - name: Verify Cluster State and Active Pod Images
+        run: |
+          kubectl get pods -o wide
+          kubectl get services
+          echo "Verifying running image in deployment/relay:"
+          kubectl get deployment relay -o jsonpath='{.spec.template.spec.containers[?(@.name=="relay")].image}'
+          echo ""
